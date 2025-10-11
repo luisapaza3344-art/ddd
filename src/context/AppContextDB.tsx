@@ -5,9 +5,11 @@ import {
   Retiro,
   Apuesta,
   EstadisticasCasa,
+  Moneda,
 } from '../types';
 import { calcularResultadoApuesta } from '../utils/calculations';
-import { storage } from '../utils/storage';
+import { TipoCambio, obtenerTipoCambio, convertirMoneda } from '../utils/currency';
+import * as DB from '../utils/database';
 
 interface AppContextType {
   // Estado
@@ -15,10 +17,12 @@ interface AppContextType {
   depositos: Deposito[];
   retiros: Retiro[];
   apuestas: Apuesta[];
+  dbLista: boolean;
+  tipoCambio: TipoCambio | null;
   
   // Casas de apuestas
-  agregarCasa: (nombre: string) => void;
-  editarCasa: (id: string, nombre: string) => void;
+  agregarCasa: (nombre: string, moneda: Moneda) => void;
+  editarCasa: (id: string, nombre: string, moneda: Moneda) => void;
   eliminarCasa: (id: string) => void;
   
   // Depósitos
@@ -43,6 +47,9 @@ interface AppContextType {
     totalRetirado: number;
   };
   obtenerEstadisticasTodasCasas: () => EstadisticasCasa[];
+  
+  // Base de datos
+  recargarDatos: () => void;
 }
 
 const AppContext = createContext<AppContextType | undefined>(undefined);
@@ -52,108 +59,132 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [depositos, setDepositos] = useState<Deposito[]>([]);
   const [retiros, setRetiros] = useState<Retiro[]>([]);
   const [apuestas, setApuestas] = useState<Apuesta[]>([]);
+  const [dbLista, setDbLista] = useState(false);
+  const [tipoCambio, setTipoCambio] = useState<TipoCambio | null>(null);
 
-  // Cargar datos al iniciar
+  // Inicializar base de datos y tipo de cambio
   useEffect(() => {
-    setCasas(storage.casas.cargar());
-    setDepositos(storage.depositos.cargar());
-    setRetiros(storage.retiros.cargar());
-    setApuestas(storage.apuestas.cargar());
+    async function init() {
+      try {
+        await DB.inicializarDB();
+        recargarDatos();
+        setDbLista(true);
+        
+        // Obtener tipo de cambio
+        const tc = await obtenerTipoCambio();
+        setTipoCambio(tc);
+      } catch (error) {
+        console.error('Error inicializando DB:', error);
+      }
+    }
+    init();
   }, []);
 
-  // Guardar casas cuando cambien
-  useEffect(() => {
-    storage.casas.guardar(casas);
-  }, [casas]);
-
-  // Guardar depósitos cuando cambien
-  useEffect(() => {
-    storage.depositos.guardar(depositos);
-  }, [depositos]);
-
-  // Guardar retiros cuando cambien
-  useEffect(() => {
-    storage.retiros.guardar(retiros);
-  }, [retiros]);
-
-  // Guardar apuestas cuando cambien
-  useEffect(() => {
-    storage.apuestas.guardar(apuestas);
-  }, [apuestas]);
-
-  // Casas de apuestas
-  const agregarCasa = (nombre: string) => {
-    const nuevaCasa: CasaApuestas = {
-      id: Date.now().toString(),
-      nombre,
-    };
-    setCasas([...casas, nuevaCasa]);
+  // Recargar todos los datos desde la BD
+  const recargarDatos = () => {
+    setCasas(DB.obtenerCasas());
+    setDepositos(DB.obtenerDepositos());
+    setRetiros(DB.obtenerRetiros());
+    setApuestas(DB.obtenerApuestas());
   };
 
-  const editarCasa = (id: string, nombre: string) => {
-    setCasas(casas.map(casa => 
-      casa.id === id ? { ...casa, nombre } : casa
-    ));
+  // Casas de apuestas
+  const agregarCasa = (nombre: string, moneda: Moneda) => {
+    DB.agregarCasa(nombre, moneda);
+    recargarDatos();
+  };
+
+  const editarCasa = (id: string, nombre: string, moneda: Moneda) => {
+    DB.editarCasa(id, nombre, moneda);
+    recargarDatos();
   };
 
   const eliminarCasa = (id: string) => {
-    setCasas(casas.filter(casa => casa.id !== id));
-    // También eliminar datos relacionados
-    setDepositos(depositos.filter(d => d.casaId !== id));
-    setRetiros(retiros.filter(r => r.casaId !== id));
-    setApuestas(apuestas.filter(a => a.casaId !== id));
+    DB.eliminarCasa(id);
+    recargarDatos();
   };
 
   // Depósitos
   const agregarDeposito = (casaId: string, monto: number, fecha: string) => {
-    const nuevoDeposito: Deposito = {
-      id: Date.now().toString(),
-      casaId,
-      monto,
-      fecha,
-    };
-    setDepositos([...depositos, nuevoDeposito]);
+    // NO guardamos TC para depósitos - siempre usan el TC actual
+    DB.agregarDeposito(casaId, monto, fecha);
+    recargarDatos();
   };
 
   const eliminarDeposito = (id: string) => {
-    setDepositos(depositos.filter(d => d.id !== id));
+    DB.eliminarDeposito(id);
+    recargarDatos();
   };
 
   // Retiros
   const agregarRetiro = (casaId: string, monto: number, fecha: string) => {
-    const nuevoRetiro: Retiro = {
-      id: Date.now().toString(),
-      casaId,
-      monto,
-      fecha,
-    };
-    setRetiros([...retiros, nuevoRetiro]);
+    // NO guardamos TC para retiros - siempre usan el TC actual
+    DB.agregarRetiro(casaId, monto, fecha);
+    recargarDatos();
   };
 
   const eliminarRetiro = (id: string) => {
-    setRetiros(retiros.filter(r => r.id !== id));
+    DB.eliminarRetiro(id);
+    recargarDatos();
   };
 
   // Apuestas
   const agregarApuesta = (apuesta: Omit<Apuesta, 'id'>) => {
-    const nuevaApuesta: Apuesta = {
+    const casa = casas.find(c => c.id === apuesta.casaId);
+    
+    // Si la apuesta ya se está creando como resuelta (no pendiente) y la casa es USD, guardar tipo de cambio
+    const tipoCambioUSD = (casa?.moneda === 'USD' && apuesta.resultado !== 'pendiente' && tipoCambio) 
+      ? tipoCambio.USD_PEN 
+      : undefined;
+    
+    const fechaResolucion = apuesta.resultado !== 'pendiente' 
+      ? new Date().toISOString() 
+      : undefined;
+    
+    DB.agregarApuesta({
       ...apuesta,
-      id: Date.now().toString(),
-    };
-    setApuestas([...apuestas, nuevaApuesta]);
+      tipoCambioUSD,
+      fechaResolucion,
+    });
+    recargarDatos();
   };
 
   const editarApuesta = (id: string, apuestaActualizada: Partial<Apuesta>) => {
-    setApuestas(apuestas.map(apuesta =>
-      apuesta.id === id ? { ...apuesta, ...apuestaActualizada } : apuesta
-    ));
+    // Obtener la apuesta actual
+    const apuestaActual = apuestas.find(a => a.id === id);
+    if (!apuestaActual) {
+      DB.editarApuesta(id, apuestaActualizada);
+      recargarDatos();
+      return;
+    }
+    
+    const casa = casas.find(c => c.id === apuestaActual.casaId);
+    
+    // Si el resultado está cambiando de "pendiente" a otro estado, guardar el tipo de cambio
+    if (apuestaActual.resultado === 'pendiente' && 
+        apuestaActualizada.resultado && 
+        apuestaActualizada.resultado !== 'pendiente' &&
+        casa?.moneda === 'USD' &&
+        tipoCambio) {
+      
+      DB.editarApuesta(id, {
+        ...apuestaActualizada,
+        tipoCambioUSD: tipoCambio.USD_PEN,
+        fechaResolucion: new Date().toISOString(),
+      });
+    } else {
+      DB.editarApuesta(id, apuestaActualizada);
+    }
+    
+    recargarDatos();
   };
 
   const eliminarApuesta = (id: string) => {
-    setApuestas(apuestas.filter(a => a.id !== id));
+    DB.eliminarApuesta(id);
+    recargarDatos();
   };
 
-  // Cálculos
+  // Cálculos (igual que antes)
   const obtenerEstadisticasCasa = (casaId: string): EstadisticasCasa | null => {
     const casa = casas.find(c => c.id === casaId);
     if (!casa) return null;
@@ -209,6 +240,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
     depositos,
     retiros,
     apuestas,
+    dbLista,
+    tipoCambio,
     agregarCasa,
     editarCasa,
     eliminarCasa,
@@ -222,7 +255,19 @@ export function AppProvider({ children }: { children: ReactNode }) {
     obtenerEstadisticasCasa,
     obtenerEstadisticasTotales,
     obtenerEstadisticasTodasCasas,
+    recargarDatos,
   };
+
+  if (!dbLista) {
+    return (
+      <div className="min-h-screen bg-slate-900 flex items-center justify-center">
+        <div className="text-center">
+          <div className="animate-spin rounded-full h-16 w-16 border-b-2 border-blue-500 mx-auto mb-4"></div>
+          <p className="text-white text-lg">Inicializando base de datos...</p>
+        </div>
+      </div>
+    );
+  }
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;
 }
